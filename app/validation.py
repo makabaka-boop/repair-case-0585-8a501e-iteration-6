@@ -4,6 +4,12 @@ Pydantic rejects fields that are not declared on a model. JSON itself, however,
 permits duplicate keys in an object and conventional parsers silently keep the
 last value. Detecting those keys while the raw document is parsed makes both
 classes of errors stable 422 validation failures before any solver work begins.
+
+The optional executed prefix also carries cross-field constraints that the
+plain schema cannot express: the ordered half-open segments must tile
+``[0, p)`` with no gaps or overlaps, respect ``L`` and stay clear of their own
+source's maintenance windows. Those checks run here, after schema parsing, and
+emit locatable ``body.prefix...`` 422 errors identical in shape to the rest.
 """
 
 import json
@@ -53,6 +59,89 @@ def _with_body_location(errors):
     return normalized
 
 
+def _prefix_error(index, message, field=None):
+    loc = ("body", "prefix")
+    if index is not None:
+        loc += (index,)
+    if field is not None:
+        loc += (field,)
+    return {
+        "type": "value_error.executed_prefix",
+        "loc": loc,
+        "msg": message,
+        "input": field if field is not None else "prefix",
+    }
+
+
+def validate_executed_prefix(request: GapRequest) -> None:
+    """Validate the executed prefix against L, n and the maintenance windows.
+
+    Every failure is a locatable 422 -- the request is malformed, not an
+    unsolvable instance -- so an illegal prefix never reaches the solver and
+    can never produce a partial plan.
+    """
+    segments = request.prefix
+    if segments is None:
+        return
+
+    # Per-source blocked positions from the validated half-open windows, via
+    # the same O(n + m) difference sweep as the solver: intersecting a fixed
+    # segment must not degrade into a segment-times-windows scan.
+    blocked_by_source: dict[str, bytearray] = {}
+    if request.unavailable is not None:
+        for source_name, windows in (
+                ("A", request.unavailable.A),
+                ("B", request.unavailable.B)):
+            mark = [0] * (request.n + 1)
+            for window in windows:
+                mark[window.start] += 1
+                mark[window.end] -= 1
+            flags = bytearray(request.n)
+            active = 0
+            for k in range(request.n):
+                active += mark[k]
+                flags[k] = 1 if active > 0 else 0
+            blocked_by_source[source_name] = flags
+
+    errors = []
+    expected_start = 0
+    for index, seg in enumerate(segments):
+        if index == 0 and seg.start != 0:
+            errors.append(_prefix_error(
+                index, "executed prefix must start at position 0", "start"))
+        if index > 0 and seg.start != expected_start:
+            # The previous segment either did not end here (gap) or ends past
+            # it (overlap); both are rejected, whichever order the caller used.
+            errors.append(_prefix_error(
+                index,
+                "executed prefix segments must tile [0, p) with no gaps or "
+                "overlaps",
+                "start"))
+        if seg.end <= seg.start:
+            errors.append(_prefix_error(
+                index, "executed prefix segment must have end > start", "end"))
+        if seg.end > request.n:
+            errors.append(_prefix_error(
+                index,
+                "executed prefix segment must end at or before n", "end"))
+        if 1 <= seg.end - seg.start and seg.end - seg.start > request.L:
+            errors.append(_prefix_error(
+                index,
+                "executed prefix segment must not be longer than L", "end"))
+        expected_start = seg.end
+
+        flags = blocked_by_source.get(seg.source)
+        if flags is not None and 0 <= seg.start < seg.end <= request.n \
+                and any(flags[k] for k in range(seg.start, seg.end)):
+            errors.append(_prefix_error(
+                index,
+                f"executed prefix segment of source {seg.source} "
+                "intersects one of that source's maintenance windows"))
+
+    if errors:
+        raise RequestValidationError(errors)
+
+
 def parse_gap_request_body(content: bytes) -> GapRequest:
     """Parse strict JSON, reject duplicate keys, then validate the model."""
     if not content:
@@ -84,6 +173,8 @@ def parse_gap_request_body(content: bytes) -> GapRequest:
         raise RequestValidationError(duplicate_errors)
 
     try:
-        return GapRequest.model_validate(raw)
+        request = GapRequest.model_validate(raw)
     except ValidationError as exc:
         raise RequestValidationError(_with_body_location(exc.errors()))
+    validate_executed_prefix(request)
+    return request

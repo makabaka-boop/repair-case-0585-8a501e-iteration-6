@@ -13,6 +13,14 @@ The optional ``max_segments`` field is an integer in ``1..8``. When omitted
 the response (and the deterministic adjudication behind it) is exactly the
 legacy one; when present the solver only considers plans using at most that
 many segments.
+
+The optional ``prefix`` field lists the already executed repair segments as
+ordered ``{start, end, source}`` half-open intervals. They must tile
+``[0, p)`` with no gaps or overlaps, each within the length cap and clear of
+its own source's maintenance windows; the solver keeps them verbatim,
+recomputes their cost from the rate tables (any caller-supplied fee is not a
+declared field and is rejected), and reoptimizes only the remaining
+``[p, n)``. Omitted, ``null`` or ``[]`` reproduces the legacy response.
 """
 
 from typing import Literal
@@ -37,6 +45,21 @@ class UnavailableWindow(BaseModel):
     # Upper bound against n is enforced in the request-level validator.
     start: StrictInt = Field(ge=0)
     end: StrictInt = Field(ge=0)
+
+
+class ExecutedSegment(BaseModel):
+    """One already executed prefix segment.
+
+    Only position and source may be declared: the executed work is priced
+    again from ``costs``/fees by the service, so no caller-supplied cost can
+    enter the total. Cross-field checks (tiling, length, availability) are
+    enforced at the request level, the same way maintenance windows are.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    start: StrictInt = Field(ge=0)
+    end: StrictInt = Field(ge=0)
+    source: SourceName
 
 
 class Unavailable(BaseModel):
@@ -64,6 +87,12 @@ class GapRequest(BaseModel):
     max_segments: StrictInt | None = Field(default=None, ge=1, le=8)
     costs: list[PositionCost] = Field(min_length=1, max_length=200_000)
     unavailable: Unavailable | None = None
+    # Optional executed prefix: ordered half-open segments tiling [0, p).
+    # Omitted/None/[] means no work is fixed and the legacy computation runs.
+    # Tiling, length and availability are checked by the request-level
+    # validator together with the maintenance windows.
+    prefix: list[ExecutedSegment] | None = Field(
+        default=None, max_length=200_000)
 
     @model_validator(mode="after")
     def _costs_and_windows_must_be_valid(self) -> "GapRequest":

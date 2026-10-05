@@ -82,6 +82,13 @@ def solve_gap(
             [(w.start, w.end) for w in req.unavailable.A],
             [(w.start, w.end) for w in req.unavailable.B],
         )
+    if req.prefix is None:
+        prefix = None
+    else:
+        prefix = tuple(
+            (seg.start, seg.end, 0 if seg.source == "A" else 1)
+            for seg in req.prefix
+        )
     try:
         result = solve(
             n=req.n,
@@ -92,6 +99,7 @@ def solve_gap(
             objective=req.objective,
             unavailable=unavailable,
             max_segments=req.max_segments,
+            prefix=prefix,
         )
     except SegmentLimitExceeded:
         # A legal cover exists but its minimum segment count is above the

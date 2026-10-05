@@ -1,0 +1,15 @@
+# Host port defaults to 8000 and is overridden by API_PORT, e.g.:
+#   API_PORT=9000 docker compose up --build
+services:
+  api:
+    build: .
+    ports:
+      - "${API_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  # One-shot acceptance service: runs the pytest suite and exits.
+  #   docker compose run --rm verify
+  verify:
+    build: .
+    command: ["pytest"]
+    restart: "no"

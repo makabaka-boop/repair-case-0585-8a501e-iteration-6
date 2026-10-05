@@ -3,7 +3,7 @@
 from fastapi import Depends, FastAPI, HTTPException, Request
 
 from .models import GapRequest, GapResponse
-from .solver import NoFeasibleRepair, SegmentLimitExceeded, solve
+from .solver import NoFeasibleRepair, Segment, SegmentLimitExceeded, solve
 from .validation import parse_gap_request_body
 
 app = FastAPI(
@@ -82,6 +82,13 @@ def solve_gap(
             [(w.start, w.end) for w in req.unavailable.A],
             [(w.start, w.end) for w in req.unavailable.B],
         )
+    if req.executed_prefix:
+        executed_prefix = tuple(
+            Segment(seg.start, seg.end, seg.source)
+            for seg in req.executed_prefix
+        )
+    else:
+        executed_prefix = None
     try:
         result = solve(
             n=req.n,
@@ -92,6 +99,7 @@ def solve_gap(
             objective=req.objective,
             unavailable=unavailable,
             max_segments=req.max_segments,
+            executed_prefix=executed_prefix,
         )
     except SegmentLimitExceeded:
         # A legal cover exists but its minimum segment count is above the

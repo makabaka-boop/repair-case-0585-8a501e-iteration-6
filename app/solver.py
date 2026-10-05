@@ -20,6 +20,32 @@ filter on the unconstrained optimum. When no complete legal cover exists,
 reduces to the plain ``[j-L, j-1]`` window, so old and new code paths are
 the same computation.
 
+The optional ``executed_prefix`` argument fixes an ordered tuple of segments
+that already cover ``[0, p)`` (``0 <= p <= n``). The API layer validates the
+tiling, length and availability of those segments; their cost is recomputed
+here from the same rates and never trusted from the request. Given a fixed
+prefix the remaining ``[p, n)`` is the identical optimization problem on
+shifted positions: per-position prefix sums are shifted by ``P_s[p]`` and
+the availability tables by ``p`` (blocked points below 0 clamp to ``-1`` /
+``0``). The three established semantics carry over exactly:
+
+* ``continuity`` seeds the shifted sweep at a real final-source state (the
+  executed prefix's last segment source), so appending a new segment with a
+  different source counts one switch; boundaries *inside* the executed
+  prefix are fixed history and never re-minimized.
+* ``max_segments`` deducts the executed segment count; ``c0`` executed plus
+  a non-empty suffix needs ``c0 + 1`` segments minimum.
+* ``certainty`` is the union over the complete minimum-cost plans that
+  extend *exactly* this prefix: executed positions are forced to their
+  executed source, suffix positions come from the suffix minimum-cost set
+  (the prefix cost is a constant that cancels from the optimality test).
+
+Feasibility of the suffix is checked cost-blind before the cap comparison,
+so an uncoverable suffix is ``NoFeasibleRepair`` even when the cap has also
+run out. ``p == 0`` (empty/omitted prefix) runs the byte-identical legacy
+paths; ``p == n`` returns the executed plan itself with cost recomputed and
+all positions forced, provided the cap admits the executed count.
+
 The optional ``max_segments`` argument (request field ``max_segments``, an
 integer 1..8) restricts the plan to at most that many segments. The segment
 count then becomes part of the optimization state: every capped recurrence
@@ -230,21 +256,157 @@ def _build_availability(
 
 def solve(n: int, costs: list[tuple[int, int]], fee_a: int, fee_b: int,
           max_len: int, objective: str = OBJECTIVE_DEFAULT,
-          unavailable=None, max_segments: int | None = None) -> Solution:
+          unavailable=None, max_segments: int | None = None,
+          executed_prefix=None) -> Solution:
     """Compute the optimal cover of [0, n) plus per-position certainty.
 
     ``costs[k]`` is the pair of per-position costs ``(cost of A, cost of
     B)`` at position ``k``. ``unavailable`` is an optional
     ``(windows_a, windows_b)`` pair of half-open ``(start, end)`` windows.
     ``max_segments`` optionally bounds the number of segments; the API layer
-    guarantees it is an integer in ``[1, 8]`` when given. Inputs are assumed
-    already validated by the API layer; the algorithm itself trusts the
-    bounds.
+    guarantees it is an integer in ``[1, 8]`` when given.
+
+    ``executed_prefix`` optionally fixes an ordered tuple of segments that
+    already cover ``[0, p)``. The API layer guarantees that they tile
+    back-to-back, respect ``max_len`` and their source's maintenance windows,
+    and fit inside ``n``; their cost is recomputed here from the same rates,
+    never taken from the request. Optimization then conditions on that fixed
+    prefix: the segment cap counts the executed segments, continuity counts
+    the switch into the first new segment, and certainty is the union over
+    the complete minimum-cost plans that extend exactly this prefix.
 
     Raises :class:`NoFeasibleRepair` if availability alone rules out every
     legal cover, or :class:`SegmentLimitExceeded` if a legal cover exists but
     every one uses more than ``max_segments`` segments.
     """
+    if not executed_prefix:
+        return _solve_unconditional(
+            n, costs, fee_a, fee_b, max_len, objective,
+            unavailable, max_segments)
+
+    fees = (fee_a, fee_b)
+    prefixes = _prefix_sums(n, costs)
+    availability = _build_availability(n, unavailable)
+
+    # p is the first position not already repaired; c0 the executed count.
+    p = executed_prefix[-1].end
+    c0 = len(executed_prefix)
+
+    prefix_cost = 0
+    for segment in executed_prefix:
+        s = SOURCE_A if segment.source == "A" else SOURCE_B
+        prefix_cost += (
+            fees[s] + prefixes[s][segment.end] - prefixes[s][segment.start])
+
+    # The suffix [p, n) is the same optimization problem on the shifted
+    # positions p..n-1. Shift the per-position prefix sums by P_s[p] (the
+    # cost tables only ever see differences, so the shift is cost-neutral)
+    # and the availability tables down by p; blocked positions below 0 clamp
+    # to -1 / 0, which is exactly what a suffix-starting recurrence needs.
+    suffix_length = n - p
+    suffix_prefixes = (
+        [prefixes[SOURCE_A][j] - prefixes[SOURCE_A][p]
+         for j in range(p, n + 1)],
+        [prefixes[SOURCE_B][j] - prefixes[SOURCE_B][p]
+         for j in range(p, n + 1)],
+    )
+    suffix_availability = Availability(
+        last_down=(
+            [max(-1, availability.last_down[SOURCE_A][j] - p)
+             for j in range(p, n + 1)],
+            [max(-1, availability.last_down[SOURCE_B][j] - p)
+             for j in range(p, n + 1)],
+        ),
+        next_down=(
+            [max(0, availability.next_down[SOURCE_A][j] - p)
+             for j in range(p, n + 1)],
+            [max(0, availability.next_down[SOURCE_B][j] - p)
+             for j in range(p, n + 1)],
+        ),
+    )
+    initial_source = (
+        SOURCE_A if executed_prefix[-1].source == "A" else SOURCE_B)
+
+    if p == n:
+        # Nothing remains to schedule: the fixed prefix is the unique
+        # complete plan, so every executed position is forced to its
+        # segment's source. Feasibility is already certain; the cap only has
+        # to admit the executed work.
+        if max_segments is not None and c0 > max_segments:
+            raise SegmentLimitExceeded()
+        forced = []
+        for segment in executed_prefix:
+            label = (CERTAINTY_A_ONLY if segment.source == "A"
+                     else CERTAINTY_B_ONLY)
+            forced.extend([label] * (segment.end - segment.start))
+        return Solution(prefix_cost, tuple(executed_prefix), tuple(forced))
+
+    # Feasibility of the non-empty suffix is decided first, cost-blind:
+    # with no legal completion the answer is NO_FEASIBLE_REPAIR even when
+    # the cap would also have run out. With a cap the executed count
+    # consumes part of the review desk's budget; the remainder needs at
+    # least one new segment.
+    min_needed = _min_segment_counts(
+        suffix_length, max_len, suffix_availability)
+    if min_needed is None:
+        raise NoFeasibleRepair()
+    if max_segments is not None:
+        if c0 >= max_segments or min_needed > max_segments - c0:
+            raise SegmentLimitExceeded()
+        remaining_cap = max_segments - c0
+
+    if max_segments is None:
+        if objective == OBJECTIVE_CONTINUITY:
+            suffix_solution = _solve_continuity(
+                suffix_length, suffix_prefixes, fees, max_len,
+                suffix_availability, initial_source=initial_source)
+        else:
+            suffix_solution = _solve_default(
+                suffix_length, suffix_prefixes, fees, max_len,
+                suffix_availability)
+        suffix_certainty = _certainty(
+            suffix_length, suffix_prefixes, fees, max_len,
+            suffix_availability)
+    else:
+        if objective == OBJECTIVE_CONTINUITY:
+            suffix_solution = _solve_capped_continuity(
+                suffix_length, suffix_prefixes, fees, max_len,
+                suffix_availability, remaining_cap,
+                initial_source=initial_source)
+            exact_f = _capped_min_prefix_costs(
+                suffix_length, suffix_prefixes, fees, max_len,
+                suffix_availability, remaining_cap)
+        else:
+            suffix_solution, exact_f = _solve_capped_default(
+                suffix_length, suffix_prefixes, fees, max_len,
+                suffix_availability, remaining_cap)
+        suffix_certainty = _certainty_capped(
+            suffix_length, suffix_prefixes, fees, max_len,
+            suffix_availability, remaining_cap, exact_f)
+
+    new_segments = tuple(
+        Segment(segment.start + p, segment.end + p, segment.source)
+        for segment in suffix_solution.segments)
+
+    # Prefix positions are forced to their executed source in every complete
+    # minimum-cost plan; suffix positions follow the suffix optimal set.
+    forced_labels = []
+    for segment in executed_prefix:
+        label = (CERTAINTY_A_ONLY if segment.source == "A"
+                 else CERTAINTY_B_ONLY)
+        forced_labels.extend([label] * (segment.end - segment.start))
+    certainty = tuple(forced_labels) + tuple(suffix_certainty)
+
+    return Solution(
+        cost=prefix_cost + suffix_solution.cost,
+        segments=tuple(executed_prefix) + new_segments,
+        certainty=certainty,
+    )
+
+
+def _solve_unconditional(n, costs, fee_a, fee_b, max_len, objective,
+                         unavailable, max_segments) -> Solution:
+    """The legacy computation without an executed prefix."""
     fees = (fee_a, fee_b)
     prefixes = _prefix_sums(n, costs)
     availability = _build_availability(n, unavailable)
@@ -363,9 +525,15 @@ def _solve_default(n: int, prefixes: tuple[list[int], list[int]],
 
 def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
                       fees: tuple[int, int], max_len: int,
-                      availability: Availability) -> Solution:
+                      availability: Availability,
+                      initial_source: int | None = None) -> Solution:
     # State p is the source of the last segment (0=A, 1=B). Arrays are
     # indexed [p][j]. The empty prefix is not state A or B.
+    #
+    # With an executed prefix, position 0 of this (possibly shifted)
+    # subproblem is already a real endpoint whose last segment source is
+    # ``initial_source``; the no-source sentinel is then disabled and index 0
+    # seeds the real-state windows at zero cost/switch/segment count.
     best_cost = [[_INF] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
     switches = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
     seg_count = [[0] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
@@ -374,12 +542,25 @@ def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
     prev_index = [[-1] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
     prev_state = [[_NO_SOURCE] * (n + 1) for _ in (SOURCE_A, SOURCE_B)]
 
-    # windows[p][s] contains state-p prefixes to which a source-s segment is
-    # appended. The two no-source rows hold only index 0 until it expires.
-    windows = tuple(
-        tuple(deque([0]) for _s in (SOURCE_A, SOURCE_B))
-        for _p in range(3)
-    )
+    if initial_source is None:
+        # windows[p][s] contains state-p prefixes to which a source-s
+        # segment is appended. The two no-source rows hold only index 0
+        # until it expires.
+        windows = tuple(
+            tuple(deque([0]) for _s in (SOURCE_A, SOURCE_B))
+            for _p in range(3)
+        )
+    else:
+        # A fixed prefix is in force: index 0 is a genuine final-source
+        # endpoint and the sentinel rows stay empty so no second "first"
+        # segment can be created.
+        best_cost[initial_source][0] = 0
+        full_keys[initial_source][0] = (0, 0, 0, 0, initial_source, ())
+        windows = tuple(
+            tuple(deque([0]) if p == initial_source else deque()
+                  for _s in (SOURCE_A, SOURCE_B))
+            for p in range(3)
+        )
 
     for j in range(1, n + 1):
         for s in (SOURCE_A, SOURCE_B):
@@ -461,6 +642,11 @@ def _solve_continuity(n: int, prefixes: tuple[list[int], list[int]],
                         break
                     window.pop()
                 window.append(j)
+
+    if n == 0 and initial_source is not None:
+        # An already-complete fixed prefix: there is no suffix plan to
+        # reconstruct; the caller adds the fixed segments and cost itself.
+        return Solution(cost=0, segments=())
 
     final_candidate = None
     final_state = SOURCE_A
@@ -1028,15 +1214,17 @@ def _solve_capped_default(
 def _solve_capped_continuity(
     n: int, prefixes: tuple[list[int], list[int]],
     fees: tuple[int, int], max_len: int, availability: Availability,
-    max_segments: int,
+    max_segments: int, initial_source: int | None = None,
 ) -> Solution:
     """Continuity objective layered by exact segment count.
 
     It is the unbounded continuity recurrence with an outer layer sweep:
     predecessor states come exclusively from the previous layer, layer 1 is
-    fed by the no-source sentinel only, and full recursive continuity keys
-    decide A-vs-B predecessor ties at the same endpoint. Final selection
-    compares ``(cost, switches, layer, last-start, final source)``.
+    fed by the no-source sentinel only (or, with a fixed prefix, by the
+    executed prefix's final source at index 0), and full recursive
+    continuity keys decide A-vs-B predecessor ties at the same endpoint.
+    Final selection compares ``(cost, switches, layer, last-start, final
+    source)``.
     """
     final_candidate = None
     final_state = SOURCE_A
@@ -1062,7 +1250,7 @@ def _solve_capped_continuity(
             for _ in (SOURCE_A, SOURCE_B)
         ]
 
-        if c == 1:
+        if c == 1 and initial_source is None:
             # First segments [0, j) out of the empty prefix: one deque per
             # source, expiring exactly like an ordinary predecessor window.
             for s in (SOURCE_A, SOURCE_B):
@@ -1088,9 +1276,16 @@ def _solve_capped_continuity(
                 tuple(deque() for _s in (SOURCE_A, SOURCE_B))
                 for _p in (SOURCE_A, SOURCE_B)
             )
+            if c == 1:
+                # Fixed executed prefix: index 0 is a real state at source
+                # initial_source with zero relative cost/switches/segments;
+                # only that state's windows are seeded.
+                for s in (SOURCE_A, SOURCE_B):
+                    windows[initial_source][s].append(0)
+
             for j in range(1, n + 1):
                 predecessor = j - 1
-                if predecessor >= 1:
+                if c >= 2 and predecessor >= 1:
                     for p in (SOURCE_A, SOURCE_B):
                         if previous_cost[p][predecessor] >= _INF_Q:
                             continue
@@ -1123,20 +1318,34 @@ def _solve_capped_continuity(
                         if not window:
                             continue
                         i = window[0]
+                        if c == 1:
+                            # The seed is the fixed prefix endpoint; the
+                            # switch into this first new segment still
+                            # counts (0 if it keeps the prefix's source).
+                            prefix_cost_value = 0
+                            prefix_switch_value = 0
+                            prefix_key_value = (
+                                0, 0, 0, 0, initial_source, ())
+                            seed_state = initial_source
+                        else:
+                            prefix_cost_value = previous_cost[p][i]
+                            prefix_switch_value = previous_switches[p][i]
+                            prefix_key_value = previous_keys[p][i]
+                            seed_state = p
                         candidate = (
-                            previous_cost[p][i] - prefixes[s][i]
+                            prefix_cost_value - prefixes[s][i]
                             + prefixes[s][j] + fees[s],
-                            previous_switches[p][i]
-                            + (0 if p == s else 1),
+                            prefix_switch_value
+                            + (0 if seed_state == s else 1),
                             c,
                             i,
                             s,
-                            previous_keys[p][i],
+                            prefix_key_value,
                         )
                         if best_candidate is None \
                                 or candidate < best_candidate:
                             best_candidate = candidate
-                            chosen_predecessor = p
+                            chosen_predecessor = seed_state if c == 1 else p
                     if best_candidate is None:
                         continue
                     cost, switch_count, _count, i, _s, _tie = \
